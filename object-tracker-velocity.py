@@ -6,9 +6,74 @@ from collections import deque
 import cv2
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-import pickle
 from sklearn.preprocessing import StandardScaler
 import os
+from scipy.signal import savgol_filter
+
+class KalmanFilter:
+    """
+    Filtro di Kalman per tracking preciso di posizione e velocità
+    """
+    def __init__(self, dt=0.1):
+        self.dt = dt
+        
+        # State: [x, y, z, vx, vy, vz]
+        self.state = np.zeros(6)
+        
+        # State transition matrix
+        self.F = np.array([
+            [1, 0, 0, dt, 0, 0],
+            [0, 1, 0, 0, dt, 0],
+            [0, 0, 1, 0, 0, dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ])
+        
+        # Measurement matrix (observe position only)
+        self.H = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0]
+        ])
+        
+        # Process noise covariance
+        self.Q = np.eye(6) * 0.1
+        
+        # Measurement noise covariance
+        self.R = np.eye(3) * 1.0
+        
+        # Error covariance
+        self.P = np.eye(6) * 100.0
+        
+        self.initialized = False
+    
+    def predict(self):
+        """Predict step"""
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
+    
+    def update(self, measurement):
+        """Update step with new measurement"""
+        if not self.initialized:
+            self.state[:3] = measurement
+            self.initialized = True
+            return
+        
+        # Kalman gain
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        # Update
+        y = measurement - self.H @ self.state
+        self.state = self.state + K @ y
+        self.P = (np.eye(6) - K @ self.H) @ self.P
+    
+    def get_position(self):
+        return self.state[:3]
+    
+    def get_velocity(self):
+        return self.state[3:6]
 
 @dataclass
 class MissileTrajectory:
@@ -22,12 +87,12 @@ class MissileTrajectory:
 
 class MissileManeuverPredictor(nn.Module):
     """
-    Rete neurale LSTM per predire manovre future dei missili.
+    Rete neurale LSTM avanzata per predire manovre future dei missili.
     Input: sequenza di stati passati (pos, vel, acc)
-    Output: traiettoria futura predetta
+    Output: traiettoria futura predetta con alta precisione
     """
     
-    def __init__(self, input_size=9, hidden_size=128, num_layers=3, 
+    def __init__(self, input_size=15, hidden_size=256, num_layers=4, 
                  output_size=9, prediction_horizon=30):
         super(MissileManeuverPredictor, self).__init__()
         
@@ -35,44 +100,74 @@ class MissileManeuverPredictor(nn.Module):
         self.num_layers = num_layers
         self.prediction_horizon = prediction_horizon
         
-        # LSTM per catturare pattern temporali
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                           batch_first=True, dropout=0.2)
-        
-        # Attention mechanism per focus su manovre critiche
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads=4)
-        
-        # Decoder per predizione multi-step
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_size, 256),
+        # Feature embedding per catturare relazioni complesse
+        self.feature_embedding = nn.Sequential(
+            nn.Linear(input_size, 64),
             nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Dropout(0.1)
+        )
+        
+        # LSTM principale con più capacità
+        self.lstm = nn.LSTM(64, hidden_size, num_layers, 
+                           batch_first=True, dropout=0.3, bidirectional=True)
+        
+        # Self-attention avanzato
+        self.attention = nn.MultiheadAttention(hidden_size * 2, num_heads=8, dropout=0.1)
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(hidden_size * 2)
+        
+        # Decoder più profondo per predizione multi-step
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_size * 2, 512),
+            nn.ReLU(),
+            nn.LayerNorm(512),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.LayerNorm(256),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, output_size * prediction_horizon)
         )
         
-        # Classificatore tipo manovra
+        # Classificatore tipo manovra migliorato
         self.maneuver_classifier = nn.Sequential(
-            nn.Linear(hidden_size, 64),
+            nn.Linear(hidden_size * 2, 128),
+            nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 7)  # 7 tipi di manovra
+        )
+        
+        # Uncertainty estimation
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(hidden_size * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, prediction_horizon)
         )
         
     def forward(self, x, return_attention=False):
         # x shape: [batch, sequence_length, features]
         batch_size = x.size(0)
         
-        # LSTM encoding
-        lstm_out, (hidden, cell) = self.lstm(x)
+        # Feature embedding
+        embedded = self.feature_embedding(x)
+        
+        # LSTM encoding (bidirectional)
+        lstm_out, (hidden, cell) = self.lstm(embedded)
         
         # Self-attention su sequenza
         attn_out, attention_weights = self.attention(
             lstm_out, lstm_out, lstm_out
         )
         
-        # Combina LSTM e attention
-        combined = lstm_out + attn_out
+        # Residual connection + layer norm
+        combined = self.layer_norm(lstm_out + attn_out)
         
         # Usa ultimo hidden state per predizione
         last_hidden = combined[:, -1, :]
@@ -86,9 +181,12 @@ class MissileManeuverPredictor(nn.Module):
         # Classifica tipo di manovra
         maneuver_type = self.maneuver_classifier(last_hidden)
         
+        # Uncertainty estimation
+        uncertainty = torch.sigmoid(self.uncertainty_head(last_hidden))
+        
         if return_attention:
-            return future_trajectory, maneuver_type, attention_weights
-        return future_trajectory, maneuver_type
+            return future_trajectory, maneuver_type, uncertainty, attention_weights
+        return future_trajectory, maneuver_type, uncertainty
 
 class MLInterceptSystem:
     """
@@ -101,8 +199,12 @@ class MLInterceptSystem:
         self.predictor = MissileManeuverPredictor().to(self.device)
         
         if model_path and os.path.exists(model_path):
-            self.predictor.load_state_dict(torch.load(model_path))
-            print(f"Modello caricato da {model_path}")
+            try:
+                self.predictor.load_state_dict(torch.load(model_path))
+                print(f"Modello caricato da {model_path}")
+            except RuntimeError as e:
+                print(f"Modello incompatibile, inizializzo nuovo modello: {e}")
+                print("Il modello migliorato ha un'architettura diversa")
         
         self.predictor.eval()
         
@@ -131,69 +233,106 @@ class MLInterceptSystem:
         
     def extract_features(self, track: Dict) -> np.ndarray:
         """
-        Estrae features rilevanti per ML da track
+        Estrae features avanzate e precise per ML da track
         """
         positions = np.array(track['positions'])
         timestamps = np.array(track['timestamps'])
         
-        if len(positions) < 2:
+        if len(positions) < 3:
             return None
-            
-        # Calcola velocità e accelerazioni
-        velocities = []
-        accelerations = []
         
-        for i in range(1, len(positions)):
-            dt = timestamps[i] - timestamps[i-1]
-            if dt > 0:
-                vel = (positions[i] - positions[i-1]) / dt
-                velocities.append(vel)
-                
-                if i > 1 and len(velocities) > 1:
-                    acc = (velocities[-1] - velocities[-2]) / dt
-                    accelerations.append(acc)
-                else:
-                    accelerations.append(np.zeros(3))
+        # Smooth delle posizioni con filtro Savitzky-Golay se abbastanza punti
+        if len(positions) >= 5:
+            smoothed_positions = np.zeros_like(positions)
+            for dim in range(3):
+                try:
+                    smoothed_positions[:, dim] = savgol_filter(positions[:, dim], 
+                                                             window_length=min(5, len(positions)), 
+                                                             polyorder=2)
+                except:
+                    smoothed_positions[:, dim] = positions[:, dim]
+        else:
+            smoothed_positions = positions
         
-        velocities = np.array(velocities)
-        accelerations = np.array(accelerations[:-1] if accelerations else [])
+        # Calcola velocità con derivata centrale per maggiore precisione
+        velocities = np.zeros((len(smoothed_positions), 3))
+        for i in range(len(smoothed_positions)):
+            if i == 0:
+                # Forward difference
+                dt = timestamps[1] - timestamps[0]
+                velocities[i] = (smoothed_positions[1] - smoothed_positions[0]) / dt
+            elif i == len(smoothed_positions) - 1:
+                # Backward difference
+                dt = timestamps[i] - timestamps[i-1]
+                velocities[i] = (smoothed_positions[i] - smoothed_positions[i-1]) / dt
+            else:
+                # Central difference (più precisa)
+                dt = timestamps[i+1] - timestamps[i-1]
+                velocities[i] = (smoothed_positions[i+1] - smoothed_positions[i-1]) / dt
         
-        # Features aggiuntive
+        # Calcola accelerazioni con derivata centrale
+        accelerations = np.zeros((len(velocities), 3))
+        for i in range(len(velocities)):
+            if i == 0:
+                dt = timestamps[1] - timestamps[0]
+                accelerations[i] = (velocities[1] - velocities[0]) / dt
+            elif i == len(velocities) - 1:
+                dt = timestamps[i] - timestamps[i-1]
+                accelerations[i] = (velocities[i] - velocities[i-1]) / dt
+            else:
+                dt = timestamps[i+1] - timestamps[i-1]
+                accelerations[i] = (velocities[i+1] - velocities[i-1]) / dt
+        
+        # Features avanzate
         features = []
         
-        for i in range(len(velocities)):
-            if i < len(accelerations):
-                # Features base: posizione, velocità, accelerazione
-                base_features = np.concatenate([
-                    positions[i+1],
-                    velocities[i],
-                    accelerations[i]
-                ])
-                
-                # Features derivate
-                speed = np.linalg.norm(velocities[i])
-                acceleration_magnitude = np.linalg.norm(accelerations[i])
-                
-                # Angoli di attacco e virata
-                if speed > 0:
-                    heading = np.arctan2(velocities[i][1], velocities[i][0])
-                    pitch = np.arcsin(velocities[i][2] / speed)
-                else:
-                    heading = pitch = 0
-                
-                # Rate di cambio angolare
-                if i > 0:
-                    prev_speed = np.linalg.norm(velocities[i-1])
-                    if prev_speed > 0:
-                        prev_heading = np.arctan2(velocities[i-1][1], velocities[i-1][0])
-                        heading_rate = (heading - prev_heading) / dt
-                    else:
-                        heading_rate = 0
-                else:
-                    heading_rate = 0
-                
-                # Usa solo le features base (9 dimensioni: pos[3] + vel[3] + acc[3])
-                features.append(base_features)
+        for i in range(len(smoothed_positions)):
+            # Features base
+            pos = smoothed_positions[i]
+            vel = velocities[i]
+            acc = accelerations[i]
+            
+            # Metriche derivate
+            speed = np.linalg.norm(vel)
+            acc_magnitude = np.linalg.norm(acc)
+            
+            # Angoli di direzione
+            if speed > 0.1:
+                heading = np.arctan2(vel[1], vel[0])
+                pitch = np.arcsin(np.clip(vel[2] / speed, -1, 1))
+            else:
+                heading = pitch = 0
+            
+            # Curvatura (rate di cambio di heading)
+            curvature = 0
+            if i > 0 and speed > 0.1:
+                prev_speed = np.linalg.norm(velocities[i-1])
+                if prev_speed > 0.1:
+                    prev_heading = np.arctan2(velocities[i-1][1], velocities[i-1][0])
+                    dt = timestamps[i] - timestamps[i-1]
+                    if dt > 0:
+                        curvature = (heading - prev_heading) / dt
+            
+            # Jerk (derivata dell'accelerazione)
+            jerk_magnitude = 0
+            if i > 0:
+                dt = timestamps[i] - timestamps[i-1]
+                if dt > 0:
+                    jerk = (accelerations[i] - accelerations[i-1]) / dt
+                    jerk_magnitude = np.linalg.norm(jerk)
+            
+            # Normalizzazione dell'altitudine per stabilità numerica
+            normalized_alt = pos[2] / 100.0  # Scala metri
+            
+            # Combina tutte le features (15 dimensioni)
+            enhanced_features = np.concatenate([
+                pos,  # 3D position
+                vel,  # 3D velocity
+                acc,  # 3D acceleration
+                [speed, acc_magnitude, heading, pitch, curvature, jerk_magnitude]  # 6 features derivate
+            ])
+            
+            features.append(enhanced_features)
         
         return np.array(features) if features else None
     
@@ -223,11 +362,12 @@ class MLInterceptSystem:
         
         # Predizione
         with torch.no_grad():
-            future_trajectory, maneuver_logits = self.predictor(input_tensor)
+            future_trajectory, maneuver_logits, uncertainty = self.predictor(input_tensor)
             
         # Converti output
         future_trajectory = future_trajectory.squeeze(0).cpu().numpy()
         maneuver_probs = torch.softmax(maneuver_logits, dim=1).squeeze(0).cpu().numpy()
+        uncertainty = uncertainty.squeeze(0).cpu().numpy()
         
         # Identifica manovra più probabile
         maneuver_id = np.argmax(maneuver_probs)
@@ -605,6 +745,7 @@ class MLEnhancedInterceptSystem(MLInterceptSystem):
         
         # Tracking
         self.tracks = {}
+        self.kalman_filters = {}  # Filtri di Kalman per ogni track
         self.missiles = {}
         
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
@@ -631,20 +772,55 @@ class MLEnhancedInterceptSystem(MLInterceptSystem):
                     center_x = (x1 + x2) / 2
                     center_y = (y1 + y2) / 2
                     
-                    # Crea/aggiorna track
-                    track_id = f"track_{cls}_{int(center_x)}_{int(center_y)}"
+                    # Crea/aggiorna track con tracking più intelligente
+                    best_track_id = None
+                    min_distance = float('inf')
                     
-                    if track_id not in self.tracks:
+                    # Cerca track esistente più vicino
+                    for existing_id, existing_track in self.tracks.items():
+                        if existing_track['class'] == cls and len(existing_track['positions']) > 0:
+                            last_pos = existing_track['positions'][-1]
+                            distance = np.linalg.norm([center_x - last_pos[0], center_y - last_pos[1]])
+                            if distance < min_distance and distance < 100:  # Soglia di distanza
+                                min_distance = distance
+                                best_track_id = existing_id
+                    
+                    if best_track_id is None:
+                        # Crea nuovo track
+                        track_id = f"track_{cls}_{int(current_time*1000)}"
                         self.tracks[track_id] = {
                             'positions': [],
                             'timestamps': [],
                             'class': cls,
-                            'confidence': []
+                            'confidence': [],
+                            'kalman_positions': [],
+                            'kalman_velocities': []
                         }
+                        # Inizializza filtro di Kalman
+                        self.kalman_filters[track_id] = KalmanFilter()
+                    else:
+                        track_id = best_track_id
                     
-                    # Aggiungi posizione (simuliamo 3D per ora)
-                    world_pos = np.array([center_x, center_y, 0])
-                    self.tracks[track_id]['positions'].append(world_pos)
+                    # Posizione misurata
+                    measured_pos = np.array([center_x, center_y, 0])
+                    
+                    # Aggiorna filtro di Kalman
+                    if track_id in self.kalman_filters:
+                        kf = self.kalman_filters[track_id]
+                        kf.predict()
+                        kf.update(measured_pos)
+                        
+                        # Usa posizione filtrata
+                        filtered_pos = kf.get_position()
+                        filtered_vel = kf.get_velocity()
+                        
+                        self.tracks[track_id]['kalman_positions'].append(filtered_pos)
+                        self.tracks[track_id]['kalman_velocities'].append(filtered_vel)
+                    else:
+                        filtered_pos = measured_pos
+                    
+                    # Aggiungi posizione
+                    self.tracks[track_id]['positions'].append(filtered_pos)
                     self.tracks[track_id]['timestamps'].append(current_time)
                     self.tracks[track_id]['confidence'].append(conf)
                     
@@ -659,6 +835,19 @@ class MLEnhancedInterceptSystem(MLInterceptSystem):
                     cv2.putText(frame, f"ID: {track_id[:10]}... ({conf:.2f})", 
                               (int(x1), int(y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
+        # Rimuovi track scaduti (non aggiornati da più di 2 secondi)
+        expired_tracks = []
+        for track_id, track in self.tracks.items():
+            if len(track['timestamps']) > 0:
+                time_since_update = current_time - track['timestamps'][-1]
+                if time_since_update > 2.0:
+                    expired_tracks.append(track_id)
+        
+        for track_id in expired_tracks:
+            del self.tracks[track_id]
+            if track_id in self.kalman_filters:
+                del self.kalman_filters[track_id]
+        
         # ML predictions per ogni track
         ml_predictions = {}
         
@@ -670,13 +859,26 @@ class MLEnhancedInterceptSystem(MLInterceptSystem):
                     
                     # Visualizza predizione
                     self._draw_ml_prediction(frame, track, ml_pred)
+                    
+                    # Visualizza velocità misurata vs filtrata
+                    if 'kalman_velocities' in track and len(track['kalman_velocities']) > 0:
+                        velocity = track['kalman_velocities'][-1]
+                        speed = np.linalg.norm(velocity)
+                        last_pos = track['positions'][-1]
+                        velocity_text = f"V: {speed:.1f} m/s"
+                        cv2.putText(frame, velocity_text, 
+                                  (int(last_pos[0]) + 10, int(last_pos[1]) + 10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                        
                 except Exception as e:
                     print(f"Errore predizione per {track_id}: {e}")
         
-        # Statistiche su frame
-        cv2.putText(frame, f"Tracks: {len(self.tracks)}", (10, 30), 
+        # Statistiche avanzate su frame
+        cv2.putText(frame, f"Active Tracks: {len(self.tracks)}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"ML Predictions: {len(ml_predictions)}", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"Kalman Filters: {len(self.kalman_filters)}", (10, 90), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         return frame, ml_predictions
